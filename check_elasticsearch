@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 
 import urllib2
-
+from OpenSSL import SSL
 from nagioscheck import NagiosCheck, UsageError
 from nagioscheck import PerformanceMetric, Status
 
@@ -92,12 +92,20 @@ class ElasticSearchCheck(NagiosCheck):
         self.add_option('y', 'yellow-critical', 'yellow_critical',
                         "Have plugin issue critical alert on yellow cluster state. Defaults to False.")
 
+        self.add_option('s', 'is-https', 'is_https',
+                        "Access the ElasticSearch API via https or not. (Default http).")
+
+        self.add_option('a', 'is-aws', 'is_aws',
+                        "AWS ES does not provide some endpoints.")
+
     def check(self, opts, args):
         host = opts.host or "localhost"
         port = int(opts.port or '9200')
         prefix = opts.prefix or ""
-        if not prefix.endswith('/'):
+        if not prefix.endswith('/') and prefix != "":
             prefix += '/'
+        protocol = "https" if (opts.is_https and opts.is_https in ('https','y','true','y','yes')) else "http"
+        is_aws = opts.is_aws and opts.is_aws in ('aws','y','true','y','yes')
 
         failure_domain = []
 
@@ -124,7 +132,7 @@ class ElasticSearchCheck(NagiosCheck):
 
         # Request "about" info, so we can figure out the ES version,
         # to allow for version-specific API changes.
-        es_about = get_json(r'http://%s:%d/%s' % (host, port, prefix))
+        es_about = get_json(r'%s://%s:%d/%s' % (protocol, host, port, prefix))
         es_version = es_about['version']['number']
 
         # Request cluster 'health'.  /_cluster/health is like a tl;dr 
@@ -132,8 +140,8 @@ class ElasticSearchCheck(NagiosCheck):
         # information here.  We are primarily interested in ES' cluster 
         # 'health colour':  a little rating ES gives itself to describe 
         # how much pain it is in.
-        es_health = get_json(r'http://%s:%d/%s_cluster/health' %
-                             (host, port, prefix))
+        es_health = get_json(r'%s://%s:%d/%s_cluster/health' %
+                             (protocol, host, port, prefix))
 
         their_health = HEALTH[es_health['status'].lower()]
 
@@ -141,14 +149,15 @@ class ElasticSearchCheck(NagiosCheck):
         # Here, we can see a list of all nodes, indexes, and shards in 
         # the cluster.  This response will also contain a map detailing 
         # where all shards are living at this point in time.
-        es_state = get_json(r'http://%s:%d/%s_cluster/state' %
-                            (host, port, prefix))
+        if not is_aws:
+            es_state = get_json(r'%s://%s:%d/%s_cluster/state' %
+                            (protocol, host, port, prefix)) 
 
         # Request a bunch of useful numbers that we export as perfdata.  
         # Details like the number of get, search, and indexing 
         # operations come from here.
-        es_stats = get_json(r'http://%s:%d/%s_nodes/_local/'
-                            'stats?all=true' % (host, port, prefix))
+        es_stats = get_json(r'%s://%s:%d/%s_nodes/_local/'
+                            'stats?all=true' % (protocol, host, port, prefix))
 
         myid = es_stats['nodes'].keys()[0]
 
@@ -158,28 +167,29 @@ class ElasticSearchCheck(NagiosCheck):
         # Unlike n_dnodes (the number of data nodes), we must compute 
         # the number of master-eligible nodes ourselves.
         n_mnodes = 0
-        for esid in es_state['nodes']:
-            master_elig = True
+        if not is_aws:
+            for esid in es_state['nodes']:
+                master_elig = True
 
-            # ES will never elect 'client' nodes as masters.
-            try:
-                master_elig = not (booleanise(
-                    es_state['nodes'][esid]['attributes']
-                    ['client']))
-            except KeyError, e:
-                if e.args[0] != 'client':
-                    raise
+                # ES will never elect 'client' nodes as masters.
+                try:
+                    master_elig = not (booleanise(
+                        es_state['nodes'][esid]['attributes']
+                        ['client']))
+                except KeyError, e:
+                    if e.args[0] != 'client':
+                        raise
 
-            try:
-                master_elig = (booleanise(
-                    es_state['nodes'][esid]['attributes']
-                    ['master']))
-            except KeyError, e:
-                if e.args[0] != 'master':
-                    raise
-
-            if master_elig:
-                n_mnodes += 1
+                try:
+                    master_elig = (booleanise(
+                        es_state['nodes'][esid]['attributes']
+                        ['master']))
+                except KeyError, e:
+                    if e.args[0] != 'master':
+                        raise
+    
+                if master_elig:
+                    n_mnodes += 1
 
         n_active_shards = es_health['active_shards']
         n_relocating_shards = es_health['relocating_shards']
@@ -212,55 +222,59 @@ class ElasticSearchCheck(NagiosCheck):
         # - node_esid_map
         # - node_location_map (data nodes only)
         #
-        nodes = es_state['nodes']
-        for n in nodes:
-            name = nodes[n]['name']
-            attrs = nodes[n]['attributes']
-            node = ESNode(name, n, attrs)
+        if not is_aws:
+            nodes = es_state['nodes']
+            for n in nodes:
+                name = nodes[n]['name']
+                attrs = nodes[n]['attributes']
+                node = ESNode(name, n, attrs)
 
-            name_node_map[name] = node
-            esid_node_map[n] = node
-            node_esid_map[node] = n
-            node_shard_map[node] = []
+                name_node_map[name] = node
+                esid_node_map[n] = node
+                node_esid_map[node] = n
+                node_shard_map[node] = []
 
-            if len(failure_domain) > 0:
-                node_location_map[node] = tuple()
-                try:
-                    node_location_map[node] = (
-                        tuple(map(lambda a: attrs[a], failure_domain)))
-                except KeyError, e:
-                    # Nodes that do not store shards (e.g.: 'client' 
-                    # nodes) cannot be expected to have been configured 
-                    # with locational attributes.
-                    if 'data' not in attrs or booleanise(attrs['data']):
-                        missing_attr = e.args[0]
-                        raise Status('warning',
-                                     ("Node '%s' missing location "
-                                      "attribute '%s'" %
-                                      (name, missing_attr),))
+                if len(failure_domain) > 0:
+                    node_location_map[node] = tuple()
+                    try:
+                        node_location_map[node] = (
+                            tuple(map(lambda a: attrs[a], failure_domain)))
+                    except KeyError, e:
+                        # Nodes that do not store shards (e.g.: 'client' 
+                        # nodes) cannot be expected to have been configured 
+                        # with locational attributes.
+                        if 'data' not in attrs or booleanise(attrs['data']):
+                            missing_attr = e.args[0]
+                            raise Status('warning',
+                                         ("Node '%s' missing location "
+                                          "attribute '%s'" %
+                                          (name, missing_attr),))
 
         # Build index maps:
         #
         # - name_index_map
         #
-        indices = es_state['metadata']['indices']
-        n_indices = len(indices)
-        n_closed_indices = 0
-        for i in indices:
-            if indices[i]["state"] == "close":
-                n_closed_indices += 1
-                continue
-            idx_stns = indices[i]['settings']
-            if version(es_version) < version("1.0.0"):
-                idx = ESIndex(i,
-                              int(idx_stns['index.number_of_shards']),
-                              int(idx_stns['index.number_of_replicas']))
-            else:
-                idx = ESIndex(i,
-                              int(idx_stns['index']['number_of_shards']),
-                              int(idx_stns['index']['number_of_replicas']))
-
-            name_index_map[i] = idx
+        n_indices = ""
+        n_closed_indices = ""
+        if not is_aws:
+            indices = es_state['metadata']['indices']
+            n_indices = len(indices)
+            n_closed_indices = 0
+            for i in indices:
+                if indices[i]["state"] == "close":
+                    n_closed_indices += 1
+                    continue
+                idx_stns = indices[i]['settings']
+                if version(es_version) < version("1.0.0"):
+                    idx = ESIndex(i,
+                                  int(idx_stns['index.number_of_shards']),
+                                  int(idx_stns['index.number_of_replicas']))
+                else:
+                    idx = ESIndex(i,
+                                  int(idx_stns['index']['number_of_shards']),
+                                  int(idx_stns['index']['number_of_replicas']))
+    
+                name_index_map[i] = idx
 
         # Build shard maps:
         #
@@ -269,39 +283,40 @@ class ElasticSearchCheck(NagiosCheck):
         # - primary_replica_map
         #     - shard_location_map
         #
-        for i in name_index_map:
-            idx = name_index_map[i]
-
-            if idx not in index_primary_map:
-                index_primary_map[idx] = dict(map(lambda n: (n, None),
-                                                  range(idx.n_shards)))
-
-            idx_shards = (es_state['routing_table']['indices']
-                          [i]['shards'])
-            for d in idx_shards:
-                primary = None
-                replicas = []
-                for s in idx_shards[d]:
-                    shard = ESShard(SHARD_STATE[s['state'].upper()])
-
-                    if s['primary']:
-                        primary = shard
-                    else:
-                        replicas.append(shard)
-
-                    if s['state'] != 'UNASSIGNED':
-                        node = esid_node_map[s['node']]
-
-                        node_shard_map[node].append(shard)
-
-                        if len(failure_domain) > 0:
-                            loc = node_location_map[esid_node_map[s['node']]]
-                            shard_location_map[shard] = loc
-
-                index_primary_map[idx][int(d)] = primary
-
-                if primary is not None:
-                    primary_replica_map[primary] = replicas
+        if not is_aws:
+            for i in name_index_map:
+                idx = name_index_map[i]
+    
+                if idx not in index_primary_map:
+                    index_primary_map[idx] = dict(map(lambda n: (n, None),
+                                                      range(idx.n_shards)))
+    
+                idx_shards = (es_state['routing_table']['indices']
+                              [i]['shards'])
+                for d in idx_shards:
+                    primary = None
+                    replicas = []
+                    for s in idx_shards[d]:
+                        shard = ESShard(SHARD_STATE[s['state'].upper()])
+    
+                        if s['primary']:
+                            primary = shard
+                        else:
+                            replicas.append(shard)
+    
+                        if s['state'] != 'UNASSIGNED':
+                            node = esid_node_map[s['node']]
+    
+                            node_shard_map[node].append(shard)
+    
+                            if len(failure_domain) > 0:
+                                loc = node_location_map[esid_node_map[s['node']]]
+                                shard_location_map[shard] = loc
+    
+                    index_primary_map[idx][int(d)] = primary
+    
+                    if primary is not None:
+                        primary_replica_map[primary] = replicas
 
         #
         # Perfdata

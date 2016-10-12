@@ -19,6 +19,7 @@ setup(
       'nagioscheck==0.1.6',
       'simplejson>=3.4.0',
       'setuptools>=3.4.0',
+      'pyopenssl',
       'pip>=1.4'
     ],
     include_package_data=True
